@@ -1,0 +1,2352 @@
+======================================================================
+FILE: backend\app\core\config.py
+======================================================================
+
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    supabase_url :str
+    supabase_anon_key :str
+    supabase_service_role_key:str
+    supabase_jwt_secret:str
+    database_url:str
+    groq_api_key:str
+    openweather_api_key:str
+    
+    class Config:
+        env_file = "C:/Deep Learning/OUTFIT_AI_RECOMM/.env"
+        
+    
+settings = Settings()
+
+
+
+======================================================================
+FILE: backend\app\core\reasoning_outfit.py
+======================================================================
+
+import json
+from groq import Groq
+from app.core.config import settings
+
+groq_client = Groq(api_key=settings.groq_api_key)
+
+BATCH_REASONING_PROMPT = """You are a luxury personal stylist. For each outfit ensemble below, provide a specific 1-2 sentence stylist note explaining why it works well for the user.
+Mention color harmony with their skin undertone, weather appropriateness, or occasion styling. Keep it conversational, warm, and insightful.
+
+Context:
+Occasion: {occasion}
+Weather: {weather_description}
+Skin Undertone: {skin_undertone}
+
+Outfits:
+{outfits_text}
+
+Output format: Return ONLY a valid JSON array of strings corresponding to each outfit in order. Example:
+["Stylist note for outfit 1...", "Stylist note for outfit 2..."]
+Do NOT wrap in markdown formatting if possible, return raw JSON array."""
+
+
+def add_reasoning_to_outfits(outfits: list[dict], occasion: str, weather: dict, skin_undertone: str) -> list[dict]:
+    if not outfits:
+        return []
+
+    weather_description = f"{weather.get('temperature', 22)}°C, {weather.get('condition', 'Clear')}"
+
+    # Build descriptions for all outfits
+    outfit_lines = []
+    for idx, outfit in enumerate(outfits, 1):
+        items_desc = ", ".join(
+            f"{it.get('color', '')} {it.get('category', '')} ({it.get('subcategory', '')}, {it.get('fabric', '')})"
+            for it in outfit["items"]
+        )
+        outfit_lines.append(f"Outfit #{idx}: {items_desc}")
+
+    prompt = BATCH_REASONING_PROMPT.format(
+        occasion=occasion,
+        weather_description=weather_description,
+        skin_undertone=skin_undertone,
+        outfits_text="\n".join(outfit_lines)
+    )
+
+    try:
+        completion = groq_client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.6,
+            max_completion_tokens=400,
+        )
+        raw_content = completion.choices[0].message.content.strip()
+
+        # Strip markdown code fences if LLM included them
+        if raw_content.startswith("```"):
+            lines = raw_content.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            raw_content = "\n".join(lines).strip()
+
+        notes = json.loads(raw_content)
+        if isinstance(notes, list):
+            for i, outfit in enumerate(outfits):
+                if i < len(notes) and isinstance(notes[i], str):
+                    outfit["reasoning"] = notes[i].strip()
+                else:
+                    outfit["reasoning"] = f"A coordinated {occasion} look tailored for {weather_description} and {skin_undertone} undertones."
+            return outfits
+    except Exception as e:
+        print(f"Batched reasoning generation notice: {e}")
+
+    # Fallback if batch fails
+    for outfit in outfits:
+        if not outfit.get("reasoning"):
+            outfit["reasoning"] = f"A stylish, balanced ensemble curated for {occasion} in {weather_description} conditions."
+
+    return outfits
+
+
+
+
+======================================================================
+FILE: backend\app\core\recom_engine.py
+======================================================================
+
+from datetime import datetime, timezone
+from app.core.supabase_client import supabase
+from app.core.reasoning_outfit import add_reasoning_to_outfits
+
+OCCASIONS: dict = {
+    "wedding": {
+        "title": "Wedding / Gala",
+        "icon": "💍",
+        "formality": ["Formal", "Semi-Formal"],
+        "styles": ["Traditional", "Ethnic", "Elegant", "Festive", "Classic", "Refined", "Haute Elegance"],
+    },
+    "office": {
+        "title": "Office / Work",
+        "icon": "💼",
+        "formality": ["Formal", "Semi-Formal", "Smart Casual"],
+        "styles": ["Professional", "Minimal", "Classic", "Tailored", "Smart Casual", "Business Casual"],
+    },
+    "date": {
+        "title": "Date Night",
+        "icon": "🥂",
+        "formality": ["Semi-Formal", "Smart Casual", "Casual", "Formal"],
+        "styles": ["Smart Casual", "Elegant", "Chic", "Romantic", "Refined", "Modern"],
+    },
+    "party": {
+        "title": "Party / Night Out",
+        "icon": "🪩",
+        "formality": ["Semi-Formal", "Casual", "Formal", "Smart Casual"],
+        "styles": ["Glam", "Statement", "Modern", "Trendy", "Chic", "High Contrast", "Elegant"],
+    },
+    "casual": {
+        "title": "Casual Weekend",
+        "icon": "☕",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Relaxed", "Streetwear", "Minimal", "Everyday", "Comfortable"],
+    },
+    "brunch": {
+        "title": "Brunch & Cafe",
+        "icon": "🥞",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Chic", "Breezy", "Smart Casual", "Pastel", "Relaxed", "Minimal"],
+    },
+    "travel": {
+        "title": "Travel / Airport",
+        "icon": "✈️",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Comfortable", "Athleisure", "Layered", "Streetwear", "Relaxed", "Wrinkle-Free"],
+    },
+    "festival": {
+        "title": "Festive / Cultural",
+        "icon": "🎪",
+        "formality": ["Formal", "Semi-Formal", "Casual"],
+        "styles": ["Traditional", "Ethnic", "Vibrant", "Bohemian", "Festive", "Silk & Embroidery", "Elegant"],
+    },
+    "interview": {
+        "title": "Interview / Pitch",
+        "icon": "🎤",
+        "formality": ["Formal", "Semi-Formal", "Smart Casual"],
+        "styles": ["Professional", "Structured", "Minimal", "Classic", "Tailored", "Power Dressing"],
+    },
+    "college": {
+        "title": "College / Campus",
+        "icon": "🎓",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Streetwear", "Trendy", "Relaxed", "Sporty", "Everyday", "Overshirts"],
+    },
+    "vacation": {
+        "title": "Beach / Resort",
+        "icon": "🏖️",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Resort", "Tropical", "Breezy", "Relaxed", "Chic", "Sun-Ready"],
+    },
+    "cocktail": {
+        "title": "Cocktail & Soirée",
+        "icon": "🎭",
+        "formality": ["Formal", "Semi-Formal", "Smart Casual"],
+        "styles": ["Sleek", "Glam", "Monochrome", "Elegant", "Refined", "Satin"],
+    },
+    "gym": {
+        "title": "Fitness / Gym",
+        "icon": "🏋️",
+        "formality": ["Sportswear", "Casual", "Smart Casual"],
+        "styles": ["Athletic", "Performance", "Sporty", "Active", "Stretch", "Comfortable"],
+    },
+    "rainy": {
+        "title": "Monsoon / Rainy",
+        "icon": "🌧️",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Layered", "Dark Tones", "Cozy", "Functional", "Comfortable", "Water-Resistant"],
+    },
+    "dinner": {
+        "title": "Fine Dining & Gala",
+        "icon": "🍽️",
+        "formality": ["Formal", "Semi-Formal", "Smart Casual"],
+        "styles": ["Haute Elegance", "Classic", "Refined", "Chic", "Elegant", "Black Tie"],
+    },
+    "winter": {
+        "title": "Winter & Mountain",
+        "icon": "🏔️",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal", "Formal"],
+        "styles": ["Heavy Knits", "Cozy", "Layered", "Structured", "Warm", "Puffer"],
+    },
+    "wellness": {
+        "title": "Wellness & Lounge",
+        "icon": "🧘",
+        "formality": ["Sportswear", "Casual", "Smart Casual"],
+        "styles": ["Loungewear", "Minimal", "Breathable", "Relaxed", "Zen", "Comfortable"],
+    },
+    "art": {
+        "title": "Art & Gallery Event",
+        "icon": "🎨",
+        "formality": ["Semi-Formal", "Casual", "Smart Casual", "Formal"],
+        "styles": ["Avant-Garde", "Eclectic", "Creative", "Modern", "Chic", "Textures"],
+    },
+    "concert": {
+        "title": "Concert & Music Fest",
+        "icon": "🎸",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Edgy", "Denim", "Boho", "Statement", "Trendy", "Leather"],
+    },
+    "picnic": {
+        "title": "Sun Picnic & Garden",
+        "icon": "☀️",
+        "formality": ["Casual", "Smart Casual", "Semi-Formal"],
+        "styles": ["Pastel", "Floral", "Breezy", "Relaxed", "Everyday", "Linen Accents"],
+    },
+}
+
+
+SKIN_UNDERTONE_COLOR_MAP = {
+    "warm": {
+        "best": ["olive", "mustard", "rust", "terracotta", "camel", "warm beige", "coral", "peach", "forest green", "chocolate brown", "gold", "beige", "brown", "maroon"],
+        "good": ["teal", "burgundy", "maroon", "navy", "black", "copper"],
+        "less_flattering": ["icy blue", "icy pink", "lavender", "cool grey", "silver"],
+    },
+    "cool": {
+        "best": ["navy", "royal blue", "sky blue", "lavender", "purple", "plum", "rose", "ruby red", "emerald", "charcoal", "silver", "white", "black", "maroon"],
+        "good": ["teal", "burgundy", "maroon", "black", "grey"],
+        "less_flattering": ["mustard", "orange", "rust", "camel", "warm beige"],
+    },
+    "neutral": {
+        "best": ["black", "white", "navy", "teal", "emerald", "olive", "burgundy", "maroon", "rose", "grey", "chocolate brown", "beige", "brown"],
+        "good": ["mustard", "rust", "coral", "lavender", "forest green"],
+        "less_flattering": ["neon shades"],
+    },
+}
+
+COLD_UNSUITABLE_FABRICS = {"linen", "chiffon"}
+HOT_UNSUITABLE_FABRICS = {"wool", "leather"}
+
+# Expanded categories mapping for tops, bottoms, one-pieces, footwear, outerwear, accessories
+ACCESSORY_CATEGORIES = {
+    "watch", "sunglasses", "glasses", "belt", "bag", "handbag", "backpack", 
+    "clutch", "scarf", "muffler", "hat", "cap", "beanie", "jewelry", "necklace", 
+    "bracelet", "earrings", "ring", "tie", "bow tie", "pocket square", "cufflinks"
+}
+
+OUTERWEAR_CATEGORIES = {
+    "jacket", "blazer", "coat", "trench coat", "cardigan", "overshirt", "sweater", 
+    "sweatshirt", "hoodie", "puffer", "parka", "overcoat", "shawl", "cape", "bomber", 
+    "windbreaker", "shrug", "gilet"
+}
+
+TOP_CATEGORIES = {
+    "shirt", "t-shirt", "tshirt", "t shirt", "top", "blouse", "polo",
+    "vest", "tank top", "tank", "kurta", "kurti", "crop top", "tee", "camisole"
+}
+
+BOTTOM_CATEGORIES = {
+    "trouser", "trousers", "jeans", "pants", "pant", "shorts", "skirt", "cargo",
+    "cargos", "chinos", "joggers", "sweatpants", "leggings", "palazzo", "dhoti", "pyjama"
+}
+
+ONE_PIECE_CATEGORIES = {
+    "dress", "gown", "evening gown", "jumpsuit", "romper", "one-piece", "one piece",
+    "sari", "saree", "anarkali", "suit", "maxi"
+}
+
+FOOTWEAR_CATEGORIES = {
+    "shoes", "sandals", "heels", "sneakers", "boots", "loafers", "flats", "slippers",
+    "mules", "footwear", "slingback heels", "formal shoes", "athletic shoes", "pumps"
+}
+
+NEUTRAL_COLORS = {
+    "black", "white", "grey", "gray", "beige", "navy", "brown", "cream", 
+    "khaki", "denim", "tan", "charcoal", "ivory", "off-white", "sand", "taupe"
+}
+
+HARMONIOUS_PAIRS = [
+    {"blue", "orange"}, {"blue", "brown"}, {"navy", "burgundy"}, {"navy", "mustard"},
+    {"olive", "rust"}, {"olive", "beige"}, {"green", "pink"}, {"teal", "coral"},
+    {"maroon", "beige"}, {"forest green", "tan"}, {"camel", "black"}, {"sky blue", "white"},
+    {"olive", "cream"}, {"burgundy", "grey"}, {"navy", "white"}, {"black", "red"}
+]
+
+CLASHING_COLOR_PAIRS = [
+    {"red", "orange"}, {"red", "magenta"}, {"neon green", "brown"},
+    {"purple", "orange"}, {"yellow", "magenta"}, {"lime", "burgundy"}
+]
+
+
+def normalize(value: str | None) -> str:
+    """'  Shirt ' -> 'shirt', None -> ''"""
+    if not value:
+        return ""
+    return str(value).strip().lower()
+
+
+def normalize_tag(value: str | None, tag_type: str = "general") -> str:
+    """
+    Normalizes freeform tags into standardized vocabulary.
+    Handles compound tags like 'Cotton Blend', 'T-shirt', 'Off-White', 'Semi Formal'.
+    """
+    if not value:
+        return ""
+    val = str(value).strip().lower()
+
+    if tag_type == "fabric":
+        for standard in ["cotton", "linen", "silk", "wool", "denim", "leather", "polyester", "chiffon", "satin", "velvet", "rayon", "nylon", "knitwear", "fleece"]:
+            if standard in val:
+                return standard
+        return val
+
+    if tag_type == "formality":
+        if any(w in val for w in ["formal", "black tie"]):
+            return "Semi-Formal" if "semi" in val else "Formal"
+        if "smart" in val or "business" in val:
+            return "Smart Casual"
+        if "casual" in val:
+            return "Casual"
+        if any(w in val for w in ["sport", "athletic", "active"]):
+            return "Sportswear"
+        if any(w in val for w in ["ethnic", "traditional"]):
+            return "Ethnic"
+        return value.title()
+
+    if tag_type == "color":
+        for standard in ["black", "white", "navy", "grey", "gray", "beige", "brown", "maroon", "burgundy", "blue", "green", "olive", "red", "pink", "yellow", "orange", "purple", "lavender", "teal", "mustard", "rust", "coral", "peach", "gold", "silver", "tan", "cream"]:
+            if standard in val:
+                return standard
+        return val
+
+    return val
+
+
+def classify_slot(item: dict) -> str:
+    """
+    Classifies a wardrobe item into 'tops', 'bottoms', 'outerwear', 'one_pieces',
+    'footwear', 'accessories', or 'other'.
+    """
+    cat = normalize(item.get("category"))
+    subcat = normalize(item.get("subcategory"))
+    combined = f"{cat} {subcat}"
+
+    # 1. Accessories
+    for acc in ACCESSORY_CATEGORIES:
+        if acc in cat or acc in subcat:
+            return "accessories"
+
+    # 2. One-pieces
+    for op in ONE_PIECE_CATEGORIES:
+        if op in cat or op in subcat:
+            return "one_pieces"
+
+    # 3. Footwear
+    for fw in FOOTWEAR_CATEGORIES:
+        if fw in cat or fw in subcat:
+            return "footwear"
+
+    # 4. Bottoms
+    for bot in BOTTOM_CATEGORIES:
+        if bot in cat or bot in subcat:
+            return "bottoms"
+
+    # 5. Outerwear
+    for ow in OUTERWEAR_CATEGORIES:
+        if ow in cat or ow in subcat:
+            return "outerwear"
+
+    # 6. Tops
+    for top in TOP_CATEGORIES:
+        if top in cat or top in subcat:
+            return "tops"
+
+    # Keyword heuristics fallback
+    if any(w in combined for w in ["pant", "jean", "short", "skirt", "trouser", "bottom"]):
+        return "bottoms"
+    if any(w in combined for w in ["jacket", "blazer", "coat", "hoodie", "sweater", "cardigan"]):
+        return "outerwear"
+    if any(w in combined for w in ["shirt", "tee", "top", "blouse", "kurta", "kurti"]):
+        return "tops"
+    if any(w in combined for w in ["shoe", "heel", "sandal", "sneaker", "boot", "loafer"]):
+        return "footwear"
+    if any(w in combined for w in ["dress", "gown", "jumpsuit"]):
+        return "one_pieces"
+    if any(w in combined for w in ["watch", "sunglass", "belt", "bag", "jewelry"]):
+        return "accessories"
+
+    return "other"
+
+
+def get_user_wardrobe(user_id: str) -> list[dict]:
+    try:
+        result = (
+            supabase.table("wardrobe_items")
+            .select("*")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        items = result.data or []
+        # Python-side null-safe filter for never_wear
+        return [it for it in items if not it.get("never_wear")]
+    except Exception as e:
+        print(f"Wardrobe fetch error: {e}")
+        return []
+
+
+def get_user_profile_data(user_id: str) -> dict:
+    try:
+        res = supabase.table("user_profile").select("*").eq("user_id", user_id).limit(1).execute()
+        if res.data:
+            return res.data[0]
+    except Exception as e:
+        print(f"Profile fetch notice: {e}")
+    return {}
+
+
+def get_user_feedback_data(user_id: str) -> dict:
+    feedback_summary = {"liked_items": set(), "disliked_items": set(), "never_wear_items": set()}
+    try:
+        res = supabase.table("feedback").select("*").eq("user_id", user_id).execute()
+        if res.data:
+            for fb in res.data:
+                item_id = fb.get("item_id")
+                if not item_id:
+                    continue
+                if fb.get("never_wear"):
+                    feedback_summary["never_wear_items"].add(item_id)
+                elif fb.get("liked") is True or (fb.get("rating") and fb.get("rating") >= 4):
+                    feedback_summary["liked_items"].add(item_id)
+                elif fb.get("liked") is False or (fb.get("rating") and fb.get("rating") <= 2):
+                    feedback_summary["disliked_items"].add(item_id)
+    except Exception as e:
+        print(f"Feedback fetch notice: {e}")
+    return feedback_summary
+
+
+OCCASION_PROHIBITED: dict = {
+    "travel": [
+        "evening gown", "ball gown", "wedding", "bridal", "sari", "saree", 
+        "lehenga", "tuxedo", "anarkali", "sherwani", "gown"
+    ],
+    "gym": [
+        "gown", "dress", "skirt", "blouse", "suit", "blazer", "heels", "loafers", 
+        "formal", "sari", "saree", "wool", "silk", "satin", "leather"
+    ],
+    "office": [
+        "evening gown", "ball gown", "wedding", "bridal", "gown", "sweatpants", 
+        "joggers", "crop top", "flip flops", "gym", "shorts"
+    ],
+    "casual": [
+        "evening gown", "ball gown", "wedding", "bridal", "tuxedo", "gown", "sari"
+    ],
+    "college": [
+        "evening gown", "ball gown", "wedding", "bridal", "tuxedo", "gown", "sari"
+    ],
+    "picnic": [
+        "evening gown", "ball gown", "wedding", "bridal", "tuxedo", "gown", "stilettos"
+    ],
+    "wellness": [
+        "evening gown", "gown", "wedding", "blazer", "suit", "heels", "formal"
+    ],
+    "interview": [
+        "evening gown", "ball gown", "wedding", "bridal", "gown", "sweatpants", 
+        "joggers", "shorts", "flip flops", "crop top", "ripped"
+    ],
+    "wedding": [
+        "t-shirt", "tee", "sweatpants", "joggers", "shorts", "gym", "hoodie", 
+        "tracksuit", "flip flops", "slippers"
+    ],
+    "cocktail": [
+        "t-shirt", "tee", "sweatpants", "joggers", "hoodie", "shorts", "sneakers", 
+        "flip flops", "gym"
+    ],
+    "dinner": [
+        "t-shirt", "tee", "sweatpants", "joggers", "hoodie", "shorts", "sneakers", 
+        "flip flops", "gym"
+    ],
+    "brunch": [
+        "evening gown", "ball gown", "wedding", "bridal", "tuxedo", "gown", "gym", "tracksuit"
+    ],
+    "vacation": [
+        "evening gown", "ball gown", "wedding", "bridal", "tuxedo", "gown", "heavy knits", "wool", "suit"
+    ],
+    "rainy": [
+        "evening gown", "gown", "wedding", "bridal", "white dress", "chiffon", "silk"
+    ],
+}
+
+
+def is_item_prohibited_for_occasion(item: dict, occasion_key: str) -> bool:
+    occ_key = normalize(occasion_key)
+    prohibited_list = OCCASION_PROHIBITED.get(occ_key, [])
+    if not prohibited_list:
+        return False
+
+    cat = normalize(item.get("category"))
+    subcat = normalize(item.get("subcategory"))
+    style = normalize(item.get("style"))
+    combined = f"{cat} {subcat} {style}"
+
+    for p in prohibited_list:
+        if p in combined or (p in cat and len(p) > 2) or (p in subcat and len(p) > 2):
+            return True
+    return False
+
+
+def calculate_color_harmony(color_a: str, color_b: str) -> float:
+    c1 = normalize_tag(color_a, "color")
+    c2 = normalize_tag(color_b, "color")
+    if not c1 or not c2:
+        return 12.0
+
+    if any(n in c1 for n in NEUTRAL_COLORS) or any(n in c2 for n in NEUTRAL_COLORS):
+        return 18.0
+
+    if c1 == c2:
+        return 16.0
+
+    c_pair = {c1, c2}
+    for clash in CLASHING_COLOR_PAIRS:
+        if clash.issubset(c_pair) or any(p1 in c1 and p2 in c2 for p1, p2 in [tuple(clash), tuple(reversed(list(clash)))]):
+            return -20.0
+
+    for pair in HARMONIOUS_PAIRS:
+        if any(p1 in c1 and p2 in c2 for p1, p2 in [tuple(pair), tuple(reversed(list(pair)))]):
+            return 22.0
+
+    return 12.0
+
+
+def score_item(
+    item: dict, 
+    occasion_key: str, 
+    weather: dict, 
+    skin_undertone: str,
+    profile: dict = None,
+    feedback_data: dict = None
+) -> dict:
+    """
+    Scores an individual clothing item across formality, style, deep weather,
+    color theory, user profile preferences, feedback loop, and rotation freshness.
+    """
+    occ_key = normalize(occasion_key)
+    occ_data = OCCASIONS.get(occ_key, OCCASIONS["casual"])
+    profile = profile or {}
+    feedback_data = feedback_data or {}
+    item_id = item.get("id")
+
+    # Hard incompatibility check
+    if is_item_prohibited_for_occasion(item, occ_key) or (item_id and item_id in feedback_data.get("never_wear_items", set())):
+        item_with_score = item.copy()
+        item_with_score["item_score"] = -500.0
+        item_with_score["is_prohibited"] = True
+        item_with_score["color_score"] = 0
+        item_with_score["color_tier"] = "worst"
+        item_with_score["color_badge"] = "Incompatible for Occasion"
+        return item_with_score
+
+    base_score = 50.0
+
+    # 1. Formality Fit
+    item_formality = normalize_tag(item.get("formality"), "formality")
+    preferred_formalities = [normalize(f) for f in occ_data.get("formality", [])]
+    if normalize(item_formality) in preferred_formalities:
+        formality_score = 30.0
+    elif normalize(item_formality) in ["smart casual", "semi-formal", "casual"]:
+        formality_score = 15.0
+    elif normalize(item_formality) == "formal" and occ_key in ["travel", "casual", "gym", "wellness"]:
+        formality_score = -40.0
+    else:
+        formality_score = 10.0
+
+    # 2. Style Fit
+    item_style = normalize(item.get("style"))
+    style_score = 10.0
+    if item_style:
+        occ_styles = [normalize(s) for s in occ_data.get("styles", [])]
+        if any(s in item_style or item_style in s for s in occ_styles):
+            style_score = 20.0
+        else:
+            style_score = 6.0
+
+    fav_styles = [normalize(s) for s in profile.get("favorite_styles", []) if s]
+    if any(fs in item_style or item_style in fs for fs in fav_styles):
+        style_score += 15.0
+
+    # 3. Weather Appropriateness (Temperature, Condition, Humidity)
+    temp = weather.get("temperature", 22)
+    condition = normalize(weather.get("condition", ""))
+    humidity = weather.get("humidity", 50)
+    fabric = normalize_tag(item.get("fabric"), "fabric")
+    weather_score = 8.0
+
+    if temp is not None:
+        if temp < 18:
+            if fabric in {"wool", "knitwear", "denim", "leather", "fleece"}:
+                weather_score += 15.0
+            elif fabric in COLD_UNSUITABLE_FABRICS:
+                weather_score -= 20.0
+        elif temp > 28:
+            if fabric in {"cotton", "linen", "silk", "rayon"}:
+                weather_score += 15.0
+            elif fabric in HOT_UNSUITABLE_FABRICS:
+                weather_score -= 25.0
+
+    # Rain / Monsoon factor
+    if any(r in condition for r in ["rain", "drizzle", "monsoon", "shower", "thunderstorm"]):
+        if fabric in {"silk", "suede", "velvet"}:
+            weather_score -= 20.0
+        elif fabric in {"denim", "nylon", "cotton"}:
+            weather_score += 10.0
+
+    # High humidity factor
+    if humidity and humidity > 75:
+        if fabric in {"leather", "polyester"}:
+            weather_score -= 15.0
+        elif fabric in {"cotton", "linen"}:
+            weather_score += 10.0
+
+    # 4. Color Theory & Undertone
+    color = normalize_tag(item.get("color"), "color")
+    undertone_data = SKIN_UNDERTONE_COLOR_MAP.get(
+        normalize(skin_undertone),
+        SKIN_UNDERTONE_COLOR_MAP["neutral"]
+    )
+    best_colors = set(undertone_data["best"])
+    good_colors = set(undertone_data["good"])
+    less_flattering = set(undertone_data["less_flattering"])
+
+    if any(bc in color for bc in best_colors):
+        color_score = 25.0
+        tier = "best"
+        badge = "Best Color 🌟"
+    elif any(gc in color for gc in good_colors):
+        color_score = 16.0
+        tier = "good"
+        badge = "Good Color ✨"
+    elif any(lc in color for lc in less_flattering):
+        color_score = 5.0
+        tier = "worst"
+        badge = "Clashing/Avoid ⚠️"
+    else:
+        color_score = 12.0
+        tier = "neutral"
+        badge = "Harmonic Accent"
+
+    # Profile color preferences
+    fav_colors = [normalize_tag(c, "color") for c in profile.get("favorite_colors", []) if c]
+    avoid_colors = [normalize_tag(c, "color") for c in profile.get("avoided_colors", []) if c]
+
+    if any(fc in color for fc in fav_colors):
+        color_score += 20.0
+        tier = "favorite"
+        badge = "Personal Favorite ❤️"
+    elif any(ac in color for ac in avoid_colors):
+        color_score -= 30.0
+        tier = "avoided"
+        badge = "Avoided Color 🚫"
+
+    # 5. Feedback Loop
+    feedback_bonus = 0.0
+    if item_id:
+        if item_id in feedback_data.get("liked_items", set()):
+            feedback_bonus += 25.0
+        elif item_id in feedback_data.get("disliked_items", set()):
+            feedback_bonus -= 30.0
+
+    # 6. Wardrobe Rotation & Freshness
+    times_worn = item.get("times_worn") or 0
+    rotation_penalty = min(times_worn * 2.5, 20.0)
+    last_worn = item.get("last_worn")
+    if last_worn:
+        try:
+            lw_date = datetime.fromisoformat(str(last_worn).replace("Z", "+00:00"))
+            days_ago = (datetime.now(timezone.utc) - lw_date).days
+            if days_ago < 3:
+                rotation_penalty += 15.0
+        except Exception:
+            pass
+
+    # 7. Style Persona Boost
+    # Maps persona → style tags that get a bonus
+    persona_style_map = {
+        "Casual":       ["casual", "relaxed", "everyday", "comfortable", "streetwear"],
+        "Smart Casual": ["smart casual", "elevated", "polished", "chic", "minimal"],
+        "Minimalist":   ["minimal", "clean", "monochrome", "structured", "simple"],
+        "Classic":      ["classic", "timeless", "tailored", "refined", "formal"],
+        "Streetwear":   ["streetwear", "urban", "edgy", "trendy", "oversized", "sporty"],
+        "Formal":       ["formal", "professional", "executive", "power dressing", "black tie"],
+        "Bohemian":     ["boho", "bohemian", "ethnic", "floral", "eclectic", "artistic"],
+        "Ethnic":       ["ethnic", "traditional", "festive", "embroidery", "silk"],
+        "Sporty":       ["athletic", "performance", "active", "sporty", "stretch"],
+        "Maximalist":   ["statement", "glam", "high contrast", "vibrant", "bold"],
+    }
+    style_persona = normalize(profile.get("style_persona") or "Casual")
+    persona_tags = persona_style_map.get(
+        next((k for k in persona_style_map if normalize(k) == style_persona), "Casual"),
+        []
+    )
+    persona_bonus = 0.0
+    if persona_tags:
+        item_style_n = normalize(item.get("style") or "")
+        item_formality_n = normalize(item.get("formality") or "")
+        combined_item_tags = f"{item_style_n} {item_formality_n}"
+        if any(pt in combined_item_tags for pt in persona_tags):
+            persona_bonus = 18.0  # strong match to user's declared persona
+
+    # 8. Preferred Fit Awareness
+    # Maps preferred fit value → item style/subcategory keywords
+    fit_style_map = {
+        "tailored":  ["tailored", "structured", "slim fit", "fitted", "formal"],
+        "slim":      ["slim", "fitted", "skinny", "tapered", "narrow"],
+        "relaxed":   ["relaxed", "loose", "comfort", "wide leg", "regular"],
+        "oversized": ["oversized", "baggy", "wide", "drop shoulder", "boxy"],
+        "hybrid":    [],  # no penalty/bonus — hybrid accepts all fits
+    }
+    preferred_fit = normalize(profile.get("preferred_fit") or "hybrid")
+    fit_keywords = fit_style_map.get(preferred_fit, [])
+    fit_bonus = 0.0
+    if fit_keywords and preferred_fit != "hybrid":
+        item_subcat_n = normalize(item.get("subcategory") or "")
+        item_style_n2 = normalize(item.get("style") or "")
+        combined_fit_tags = f"{item_subcat_n} {item_style_n2}"
+        if any(fk in combined_fit_tags for fk in fit_keywords):
+            fit_bonus = 10.0
+
+    total_item_score = (
+        base_score + formality_score + style_score + weather_score +
+        color_score + feedback_bonus + persona_bonus + fit_bonus - rotation_penalty
+    )
+
+    item_with_score = item.copy()
+    item_with_score["item_score"] = round(total_item_score, 1)
+    item_with_score["is_prohibited"] = False
+    item_with_score["color_score"] = int(color_score)
+    item_with_score["color_tier"] = tier
+    item_with_score["color_badge"] = badge
+    return item_with_score
+
+
+def group_by_slot(scored_items: list[dict]) -> dict:
+    grouped = {
+        "tops": [],
+        "bottoms": [],
+        "outerwear": [],
+        "one_pieces": [],
+        "footwear": [],
+        "accessories": [],
+        "other": []
+    }
+    for item in scored_items:
+        slot = classify_slot(item)
+        if slot in grouped:
+            grouped[slot].append(item)
+        else:
+            grouped["other"].append(item)
+
+    # Wardrobe resilience: if no tops but sweaters/hoodies in outerwear, copy them to tops
+    if not grouped["tops"] and grouped["outerwear"]:
+        for ow in grouped["outerwear"]:
+            cat = normalize(ow.get("category"))
+            subcat = normalize(ow.get("subcategory"))
+            if any(w in f"{cat} {subcat}" for w in ["sweater", "hoodie", "cardigan", "sweatshirt"]):
+                grouped["tops"].append(ow)
+
+    return grouped
+
+
+def build_combinations(grouped: dict, occasion_key: str, weather: dict = None) -> list[dict]:
+    occ_key = normalize(occasion_key)
+    weather = weather or {}
+    temp = weather.get("temperature", 22)
+    combinations = []
+
+    # Filter and cap to top 15 items per slot to avoid combinatorial explosion
+    def get_safe_sorted(slot_name: str, limit: int = 15) -> list[dict]:
+        items = [
+            it for it in grouped.get(slot_name, [])
+            if not it.get("is_prohibited") and it.get("item_score", 0) > 0
+        ]
+        return sorted(items, key=lambda x: x["item_score"], reverse=True)[:limit]
+
+    safe_one_pieces = get_safe_sorted("one_pieces")
+    safe_tops = get_safe_sorted("tops")
+    safe_bottoms = get_safe_sorted("bottoms")
+    safe_footwear = get_safe_sorted("footwear")
+    safe_outerwear = get_safe_sorted("outerwear", limit=8)
+    safe_accessories = get_safe_sorted("accessories", limit=5)
+
+    # Special footwear filtering: NO heels at gym/wellness
+    if occ_key in ["gym", "wellness"]:
+        safe_footwear = [
+            fw for fw in safe_footwear 
+            if not any(w in normalize(fw.get("category")) or w in normalize(fw.get("subcategory")) for w in ["heel", "stiletto", "formal", "loafer"])
+        ]
+
+    needs_layering = (temp < 18) or (occ_key in ["winter", "office", "interview"])
+    is_formal_event = occ_key in ["wedding", "cocktail", "dinner", "party", "date", "festival", "art"]
+
+    # 1. ONE-PIECE ENSEMBLES
+    for op in safe_one_pieces:
+        bonus = 35.0 if is_formal_event else 10.0
+        effective_op_score = op["item_score"] * 1.85
+
+        # Layered with outerwear if cold
+        if needs_layering and safe_outerwear:
+            for ow in safe_outerwear[:3]:
+                harmony = calculate_color_harmony(op.get("color"), ow.get("color"))
+                if safe_footwear:
+                    for shoe in safe_footwear[:3]:
+                        total = effective_op_score + ow["item_score"] + shoe["item_score"] + bonus + harmony + 15.0
+                        combo_items = [op, ow, shoe]
+                        if safe_accessories:
+                            combo_items.append(safe_accessories[0])
+                        combinations.append({"items": combo_items, "total_score": round(total, 1), "type": "one_piece_layered"})
+                else:
+                    total = effective_op_score + ow["item_score"] + bonus + harmony + 80.0
+                    combo_items = [op, ow]
+                    combinations.append({"items": combo_items, "total_score": round(total, 1), "type": "one_piece_layered"})
+
+        # Standard One-Piece
+        if safe_footwear:
+            for shoe in safe_footwear[:5]:
+                total = effective_op_score + shoe["item_score"] + bonus
+                combo_items = [op, shoe]
+                if safe_accessories:
+                    combo_items.append(safe_accessories[0])
+                combinations.append({"items": combo_items, "total_score": round(total, 1), "type": "one_piece"})
+        else:
+            total = effective_op_score + bonus + 80.0
+            combinations.append({"items": [op], "total_score": round(total, 1), "type": "one_piece"})
+
+    # 2. TWO-PIECE & LAYERED ENSEMBLES
+    for top in safe_tops:
+        for bot in safe_bottoms:
+            top_f = normalize_tag(top.get("formality"), "formality")
+            bot_f = normalize_tag(bot.get("formality"), "formality")
+            compat = 25.0 if top_f == bot_f else 15.0
+
+            top_p = normalize(top.get("pattern"))
+            bot_p = normalize(bot.get("pattern"))
+            if top_p == "solid" or bot_p == "solid":
+                compat += 15.0
+            else:
+                compat += 5.0
+
+            color_harmony = calculate_color_harmony(top.get("color"), bot.get("color"))
+
+            # Layered with outerwear if cold or business occasion
+            if needs_layering and safe_outerwear:
+                for ow in safe_outerwear[:3]:
+                    ow_harmony = calculate_color_harmony(top.get("color"), ow.get("color"))
+                    layer_bonus = 20.0
+                    if safe_footwear:
+                        for shoe in safe_footwear[:3]:
+                            total = (top["item_score"] + bot["item_score"] + ow["item_score"] + 
+                                     shoe["item_score"] + compat + color_harmony + ow_harmony + layer_bonus)
+                            combo_items = [top, bot, ow, shoe]
+                            if safe_accessories:
+                                combo_items.append(safe_accessories[0])
+                            combinations.append({"items": combo_items, "total_score": round(total, 1), "type": "two_piece_layered"})
+                    else:
+                        total = (top["item_score"] + bot["item_score"] + ow["item_score"] + 
+                                 compat + color_harmony + ow_harmony + layer_bonus + 70.0)
+                        combinations.append({"items": [top, bot, ow], "total_score": round(total, 1), "type": "two_piece_layered"})
+
+            # Standard Two-Piece
+            if safe_footwear:
+                for shoe in safe_footwear[:5]:
+                    total = top["item_score"] + bot["item_score"] + shoe["item_score"] + compat + color_harmony
+                    combo_items = [top, bot, shoe]
+                    if safe_accessories:
+                        combo_items.append(safe_accessories[0])
+                    combinations.append({"items": combo_items, "total_score": round(total, 1), "type": "two_piece"})
+            else:
+                total = top["item_score"] + bot["item_score"] + compat + color_harmony + 80.0
+                combinations.append({"items": [top, bot], "total_score": round(total, 1), "type": "two_piece"})
+
+    # 3. WARDROBE ADAPTIVE FALLBACK
+    if not combinations:
+        if safe_tops and not safe_bottoms and not safe_one_pieces:
+            for top in safe_tops:
+                if safe_footwear:
+                    for shoe in safe_footwear[:3]:
+                        combinations.append({"items": [top, shoe], "total_score": round(top["item_score"] + shoe["item_score"] + 50.0, 1), "type": "incomplete_top"})
+                else:
+                    combinations.append({"items": [top], "total_score": round(top["item_score"] + 100.0, 1), "type": "single_top"})
+        elif safe_bottoms and not safe_tops and not safe_one_pieces:
+            for bot in safe_bottoms:
+                if safe_footwear:
+                    for shoe in safe_footwear[:3]:
+                        combinations.append({"items": [bot, shoe], "total_score": round(bot["item_score"] + shoe["item_score"] + 50.0, 1), "type": "incomplete_bottom"})
+                else:
+                    combinations.append({"items": [bot], "total_score": round(bot["item_score"] + 100.0, 1), "type": "single_bottom"})
+
+    return combinations
+
+
+def calculate_overlap_ratio(combo_a: dict, combo_b: dict) -> float:
+    """
+    Computes Jaccard overlap ratio between two outfits.
+    """
+    ids_a = {it["id"] for it in combo_a["items"] if "id" in it}
+    ids_b = {it["id"] for it in combo_b["items"] if "id" in it}
+    if not ids_a or not ids_b:
+        return 0.0
+    intersection = len(ids_a.intersection(ids_b))
+    union = len(ids_a.union(ids_b))
+    return intersection / union if union > 0 else 0.0
+
+
+def rank_and_select_top(combinations: list[dict], top_n: int = 5) -> list[dict]:
+    """
+    Ranks combinations, applies a 60% Jaccard overlap diversity filter to avoid
+    repetitive item duplication, and computes real normalized compatibility scores.
+    """
+    sorted_combinations = sorted(
+        combinations,
+        key=lambda c: c["total_score"],
+        reverse=True
+    )
+
+    selected = []
+    for combo in sorted_combinations:
+        is_too_similar = False
+        for s in selected:
+            if calculate_overlap_ratio(combo, s) > 0.60:
+                is_too_similar = True
+                break
+        
+        if not is_too_similar:
+            selected.append(combo)
+
+        if len(selected) >= top_n:
+            break
+
+    # If diversity filter leaves fewer than top_n, backfill from remaining sorted combos
+    if len(selected) < top_n:
+        for combo in sorted_combinations:
+            if combo not in selected:
+                selected.append(combo)
+            if len(selected) >= top_n:
+                break
+
+    # Calculate real normalized compatibility percentage (70% - 98%)
+    for combo in selected:
+        items = combo["items"]
+        if items:
+            avg_item_score = sum(it.get("item_score", 50.0) for it in items) / len(items)
+            normalized = 70.0 + (avg_item_score / 120.0) * 28.0
+            combo["total_score"] = min(98.0, max(70.0, round(normalized, 1)))
+
+    return selected
+
+
+def get_recommendations(user_id: str, occasion: str, city: str, skin_undertone: str) -> list[dict]:
+    from app.core.weather_agent import get_weather
+
+    wardrobe = get_user_wardrobe(user_id)
+    if not wardrobe:
+        return []
+
+    weather = get_weather(city) if city else {"temperature": 22, "condition": "Clear", "humidity": 50}
+    profile = get_user_profile_data(user_id)
+    feedback_data = get_user_feedback_data(user_id)
+
+    effective_undertone = skin_undertone or profile.get("skin_tone") or "neutral"
+
+    scored_items = [
+        score_item(item, occasion, weather, effective_undertone, profile=profile, feedback_data=feedback_data)
+        for item in wardrobe
+    ]
+    grouped = group_by_slot(scored_items)
+    combinations = build_combinations(grouped, occasion, weather=weather)
+    top_outfits = rank_and_select_top(combinations, top_n=5)
+    top_outfits = add_reasoning_to_outfits(top_outfits, occasion, weather, effective_undertone)
+
+    return top_outfits
+
+
+
+======================================================================
+FILE: backend\app\core\security.py
+======================================================================
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from app.core.supabase_client import supabase
+
+security = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
+):
+    token = credentials.credentials
+
+    try:
+        response = supabase.auth.get_user(token)
+
+        if not response.user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token"
+            )
+
+        user = response.user
+
+        return {
+            "user_id": user.id,
+            "user_name": user.user_metadata.get("full_name")
+        }
+
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
+
+
+
+======================================================================
+FILE: backend\app\core\supabase_client.py
+======================================================================
+
+from supabase import create_client
+from app.core.config import settings
+
+
+supabase = create_client(
+    supabase_url=settings.supabase_url,
+    supabase_key=settings.supabase_service_role_key
+)
+
+
+
+======================================================================
+FILE: backend\app\core\test_recom.py
+======================================================================
+
+from app.core.recom_engine import get_recommendations
+
+result = get_recommendations(
+    user_id="edcd5cf9-bb30-4b46-b7c3-687de5d7123f",
+    occasion="office",
+    city="Noida",
+    skin_undertone="warm"
+)
+print(result)
+
+
+
+======================================================================
+FILE: backend\app\core\vision_tagging.py
+======================================================================
+
+import json
+from groq import Groq
+from app.core.config import settings
+
+client = Groq(api_key=settings.groq_api_key)
+
+TAGGING_PROMPT = """You are a fashion cataloging assistant. Look at this clothing item image and return ONLY a JSON object with these exact keys:
+
+{
+  "category": "one of: Shirt, T-shirt, Trouser, Jeans, Top, Dress, Jacket, Watch, Sunglasses, Sandals, Heels, Shoes, Other",
+  "subcategory": "a more specific label, e.g. 'Casual Shirt', 'Formal Trouser'",
+  "color": "dominant color, one or two words",
+  "style" : any one out of these"minimal , professional,ethnic,elegant,smart casual,athletic,performance,traditional etc"
+  "pattern": "e.g. Solid, Checkered, Striped, Printed, Floral",
+  "formality": "one of: Casual, Formal, Semi-Formal, Sportswear",
+  "fabric": "best guess, e.g. Cotton, Denim, Silk, Polyester, Leather"
+}
+
+Return ONLY the JSON object, no extra text, no explanation.no reasoning keep all these things noted!"""
+
+
+def tag_clothing_image(image_url: str) -> dict:
+    try:
+        completion = client.chat.completions.create(
+            model="qwen/qwen3.8-27b",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": TAGGING_PROMPT},
+                        {"type": "image_url", "image_url": {"url": image_url}}
+                    ]
+                }
+            ],
+            temperature=0.3,
+            max_completion_tokens=512,
+            response_format={"type": "json_object"},
+        )
+
+        raw_content = completion.choices[0].message.content
+        tags = json.loads(raw_content)
+        return tags
+
+    except Exception as e:
+        print(f"Vision tagging failed: {e}")
+        return {
+            "category": None,
+            "subcategory": None,
+            "color": None,
+            "pattern": None,
+            "formality": None,
+            "fabric": None,
+            "style":None
+        }
+
+
+
+======================================================================
+FILE: backend\app\core\weather_agent.py
+======================================================================
+
+import requests
+from typing import Dict, Any, Optional
+from app.core.config import settings
+
+OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
+OPENMETEO_GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPENMETEO_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+OPENMETEO_AQI_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+
+def _get_badge_levels(temp: Optional[float], humidity: Optional[int], wind_kmh: Optional[float]) -> Dict[str, Any]:
+    """Generates High / Medium / Low badges for temperature, humidity, and wind."""
+    # Temperature Badge
+    if temp is None:
+        t_badge, t_color = "Medium", "amber"
+    elif temp >= 30:
+        t_badge, t_color = "High", "red"
+    elif temp >= 18:
+        t_badge, t_color = "Medium", "emerald"
+    else:
+        t_badge, t_color = "Low", "blue"
+
+    # Humidity Badge
+    if humidity is None:
+        h_badge = "Medium"
+    elif humidity >= 70:
+        h_badge = "High"
+    elif humidity >= 40:
+        h_badge = "Medium"
+    else:
+        h_badge = "Low"
+
+    # Wind Badge
+    if wind_kmh is None:
+        w_badge = "Low"
+    elif wind_kmh >= 25:
+        w_badge = "High"
+    elif wind_kmh >= 10:
+        w_badge = "Medium"
+    else:
+        w_badge = "Low"
+
+    return {
+        "temp_badge": t_badge,
+        "temp_badge_color": t_color,
+        "humidity_badge": h_badge,
+        "wind_badge": w_badge,
+    }
+
+
+def _get_aqi_data(lat: float, lon: float) -> Dict[str, Any]:
+    """Fetches live Air Quality Index (AQI) from Open-Meteo free API."""
+    try:
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "current": "us_aqi,european_aqi,pm10,pm2_5",
+        }
+        res = requests.get(OPENMETEO_AQI_URL, params=params, timeout=4)
+        if res.status_code == 200:
+            aq_json = res.json().get("current", {})
+            us_aqi = aq_json.get("us_aqi")
+            if us_aqi is not None:
+                us_aqi = int(us_aqi)
+                if us_aqi <= 50:
+                    cat, badge, color = "Good", "Low", "emerald"
+                elif us_aqi <= 100:
+                    cat, badge, color = "Moderate", "Medium", "amber"
+                elif us_aqi <= 150:
+                    cat, badge, color = "Unhealthy for Sensitive", "Medium-High", "orange"
+                elif us_aqi <= 200:
+                    cat, badge, color = "Unhealthy", "High", "red"
+                else:
+                    cat, badge, color = "Hazardous", "Extreme High", "purple"
+
+                return {
+                    "aqi": us_aqi,
+                    "aqi_category": cat,
+                    "aqi_badge": badge,
+                    "aqi_color": color,
+                    "pm2_5": aq_json.get("pm2_5"),
+                    "pm10": aq_json.get("pm10"),
+                }
+    except Exception as e:
+        print(f"AQI fetch error: {e}")
+
+    return {
+        "aqi": 68,
+        "aqi_category": "Moderate",
+        "aqi_badge": "Medium",
+        "aqi_color": "amber",
+        "pm2_5": 20.4,
+        "pm10": 45.1,
+    }
+
+
+def _generate_fabric_advice(temp: Optional[float], humidity: Optional[int], condition: str, aqi_badge: str) -> str:
+    advice = []
+    if temp is not None:
+        if temp >= 32:
+            advice.append("Ultra-breathable linen, mulmul, or lightweight cotton. Avoid heavy polyester.")
+        elif temp >= 24:
+            advice.append("Crisp cotton poplin, chambray, or breathable blends. Perfect for light layers.")
+        elif temp >= 16:
+            advice.append("Smart transitional layering — merino knits, overshirts, or denim jackets.")
+        else:
+            advice.append("Thermal retention needed: cashmere, structured wool coats, or lined outerwear.")
+
+    if humidity and humidity >= 70:
+        advice.append("High humidity alert: pick loose-fitting silhouettes to stay breezy.")
+
+    if "rain" in condition.lower() or "drizzle" in condition.lower():
+        advice.append("Rainy conditions: avoid suede and trailing hem trousers.")
+
+    if aqi_badge in ["High", "Extreme High"]:
+        advice.append("High AQI: consider full-coverage collar jackets or chic scarves for outdoor commutes.")
+
+    return " ".join(advice) if advice else "Comfortable, versatile wardrobe styling suitable for current weather."
+
+
+def get_weather(city: str) -> dict:
+    """
+    Fetches real-time weather and Air Quality Index (AQI) for a specific city.
+    Uses OpenWeatherMap if API key is active, with seamless Open-Meteo fallback.
+    """
+    city = (city or "Noida").strip()
+
+    # 1. Try OpenWeatherMap if key is available
+    if settings.openweather_api_key and settings.openweather_api_key != "placeholder-key":
+        try:
+            params = {
+                "q": city,
+                "appid": settings.openweather_api_key,
+                "units": "metric"
+            }
+            res = requests.get(OPENWEATHER_BASE_URL, params=params, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                temp = round(data["main"]["temp"], 1)
+                feels_like = round(data["main"]["feels_like"], 1)
+                temp_min = round(data["main"].get("temp_min", temp - 2), 1)
+                temp_max = round(data["main"].get("temp_max", temp + 2), 1)
+                humidity = data["main"].get("humidity", 50)
+                wind_kmh = round(data.get("wind", {}).get("speed", 3.0) * 3.6, 1)
+                condition = data["weather"][0]["main"]
+                description = data["weather"][0]["description"].title()
+                lat = data["coord"]["lat"]
+                lon = data["coord"]["lon"]
+                country = data["sys"].get("country", "")
+                city_name = data.get("name", city)
+
+                # Icon
+                icon = "🌤️"
+                cond_l = condition.lower()
+                if "rain" in cond_l: icon = "🌧️"
+                elif "clear" in cond_l: icon = "☀️"
+                elif "cloud" in cond_l: icon = "⛅"
+                elif "thunder" in cond_l: icon = "⛈️"
+                elif "snow" in cond_l: icon = "❄️"
+                elif "fog" in cond_l or "mist" in cond_l or "haze" in cond_l: icon = "🌫️"
+
+                badges = _get_badge_levels(temp, humidity, wind_kmh)
+                aqi_data = _get_aqi_data(lat, lon)
+                advice = _generate_fabric_advice(temp, humidity, condition, aqi_data["aqi_badge"])
+
+                return {
+                    "city": city_name,
+                    "country": country,
+                    "temperature": temp,
+                    "feels_like": feels_like,
+                    "temp_min": temp_min,
+                    "temp_max": temp_max,
+                    "humidity": humidity,
+                    "wind_speed": wind_kmh,
+                    "rain": float(data.get("rain", {}).get("1h", 0.0)),
+                    "precipitation": float(data.get("rain", {}).get("1h", 0.0)),
+                    "condition": condition,
+                    "description": description,
+                    "icon": icon,
+                    **badges,
+                    **aqi_data,
+                    "fabric_advice": advice,
+                }
+        except Exception as e:
+            print(f"OpenWeather fetch failed, falling back to Open-Meteo: {e}")
+
+    # 2. Resilient Open-Meteo Fallback (No API key needed, global coverage)
+    try:
+        geo_res = requests.get(
+            OPENMETEO_GEO_URL,
+            params={"name": city, "count": 1, "language": "en", "format": "json"},
+            timeout=4
+        )
+        if geo_res.status_code == 200 and geo_res.json().get("results"):
+            geo = geo_res.json()["results"][0]
+            lat = geo["latitude"]
+            lon = geo["longitude"]
+            city_name = geo.get("name", city)
+            country = geo.get("country_code", "")
+
+            w_res = requests.get(
+                OPENMETEO_WEATHER_URL,
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+                    "daily": "temperature_2m_max,temperature_2m_min",
+                    "timezone": "auto"
+                },
+                timeout=4
+            )
+            if w_res.status_code == 200:
+                w_data = w_res.json()
+                curr = w_data.get("current", {})
+                daily = w_data.get("daily", {})
+
+                temp = round(curr.get("temperature_2m", 26.0), 1)
+                feels_like = round(curr.get("apparent_temperature", temp), 1)
+                temp_max = round(daily.get("temperature_2m_max", [temp + 2])[0], 1)
+                temp_min = round(daily.get("temperature_2m_min", [temp - 2])[0], 1)
+                humidity = int(curr.get("relative_humidity_2m", 55))
+                wind_kmh = round(curr.get("wind_speed_10m", 12.0), 1)
+                precip = float(curr.get("precipitation", 0.0))
+
+                wcode = curr.get("weather_code", 0)
+                if wcode == 0:
+                    cond, icon = "Clear Sky", "☀️"
+                elif wcode in [1, 2, 3]:
+                    cond, icon = "Partly Cloudy", "⛅"
+                elif wcode in [45, 48]:
+                    cond, icon = "Foggy / Hazy", "🌫️"
+                elif wcode in [51, 53, 55, 61, 63, 65, 80, 81]:
+                    cond, icon = "Rain / Showers", "🌧️"
+                elif wcode in [95, 96, 99]:
+                    cond, icon = "Thunderstorm", "⛈️"
+                else:
+                    cond, icon = "Overcast", "☁️"
+
+                badges = _get_badge_levels(temp, humidity, wind_kmh)
+                aqi_data = _get_aqi_data(lat, lon)
+                advice = _generate_fabric_advice(temp, humidity, cond, aqi_data["aqi_badge"])
+
+                return {
+                    "city": city_name,
+                    "country": country,
+                    "temperature": temp,
+                    "feels_like": feels_like,
+                    "temp_min": temp_min,
+                    "temp_max": temp_max,
+                    "humidity": humidity,
+                    "wind_speed": wind_kmh,
+                    "rain": precip,
+                    "precipitation": precip,
+                    "condition": cond,
+                    "description": f"{cond} in {city_name}",
+                    "icon": icon,
+                    **badges,
+                    **aqi_data,
+                    "fabric_advice": advice,
+                }
+    except Exception as e:
+        print(f"Open-Meteo fetch failed: {e}")
+
+    # 3. Graceful Static Mock if offline
+    return {
+        "city": city,
+        "country": "",
+        "temperature": 27.5,
+        "feels_like": 28.0,
+        "temp_min": 22.0,
+        "temp_max": 31.0,
+        "humidity": 58,
+        "wind_speed": 11.2,
+        "precipitation": 0.0,
+        "condition": "Pleasant / Clear",
+        "description": "Clear skies with gentle breeze",
+        "icon": "🌤️",
+        "temp_badge": "Medium",
+        "temp_badge_color": "emerald",
+        "humidity_badge": "Medium",
+        "wind_badge": "Low",
+        "aqi": 64,
+        "aqi_category": "Moderate",
+        "aqi_badge": "Medium",
+        "aqi_color": "amber",
+        "pm2_5": 18.2,
+        "pm10": 39.5,
+        "fabric_advice": "Perfect moderate climate: crisp cotton, breathable linen blends or light knitwear.",
+    }
+
+
+
+
+======================================================================
+FILE: backend\app\main.py
+======================================================================
+
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from app.routes.wardrobe import router as wardrobe_router
+from app.routes.outfit import router as outfit_router
+from app.routes.profile import router as profile_router
+
+
+app = FastAPI(
+    title="AI Smart Wardrobe",
+    version="1.0.0",
+    description="It is an AI outfit recommendation app"
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def add_no_cache_headers(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
+# API routes
+app.include_router(wardrobe_router)
+app.include_router(outfit_router)
+app.include_router(profile_router)
+
+
+@app.get("/health")
+def health_check():
+    return {
+        "success": True,
+        "health_status": "ok"
+    }
+
+
+# Static frontend
+BASE_DIR = Path(__file__).resolve().parent.parent
+STATIC_DIR = BASE_DIR / "static"
+
+app.mount(
+    "/",
+    StaticFiles(
+        directory=STATIC_DIR,
+        html=True
+    ),
+    name="static"
+)
+
+
+
+======================================================================
+FILE: backend\app\routes\outfit.py
+======================================================================
+
+import os
+import random
+import urllib.parse
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.core.security import get_current_user
+from app.core.recom_engine import get_recommendations
+from app.core.weather_agent import get_weather
+from app.core.supabase_client import supabase
+from app.schemas.outfit import OutfitRecommendRequest, OutfitCreate
+from app.schemas.feedback import FeedbackCreate
+
+router = APIRouter(tags=["recommend & outfit"])
+
+
+# ============================================================
+# 1. OCCASIONS LIST (Single Source of Truth)
+# ============================================================
+
+@router.get("/occasions")
+@router.get("/occasions/")
+@router.get("/outfit/occasions")
+@router.get("/api/occasions")
+async def list_occasions():
+    """Returns all occasions supported by the AI recommendation engine."""
+    from app.core.recom_engine import OCCASIONS
+    return [
+        {
+            "id": k,
+            "title": v.get("title", k.title()),
+            "icon": v.get("icon", "✨"),
+            "formality": v.get("formality", []),
+            "styles": v.get("styles", [])
+        }
+        for k, v in OCCASIONS.items()
+    ]
+
+
+# ============================================================
+# 2. RECOMMEND OUTFITS
+# ============================================================
+
+@router.post("/recommend")
+@router.post("/recommend/")
+@router.post("/outfit/recommend")
+@router.post("/outfit/recommend/")
+async def recommend_outfits(
+    request: OutfitRecommendRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        outfits = get_recommendations(
+            user_id=current_user["user_id"],
+            occasion=request.occasion,
+            city=request.city,
+            skin_undertone=request.skin_undertone
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Recommendation failed: {str(e)}")
+
+    if not outfits:
+        return []
+
+    return outfits
+
+
+# ============================================================
+# 2. AI GENERATE OUTFIT LOOKBOOK / PHOTOSHOOT
+# ============================================================
+
+class LookbookGenRequest(BaseModel):
+    occasion: Optional[str] = "casual"
+    reasoning: Optional[str] = None
+    items: Optional[List[Dict[str, Any]]] = []
+
+
+@router.post("/api/gemini/generate-outfit-lookbook")
+@router.get("/api/gemini/generate-outfit-lookbook")
+@router.post("/generate-outfit-lookbook")
+async def generate_outfit_lookbook(request: Optional[LookbookGenRequest] = None):
+    """
+    Synthesizes a unified high-fashion photoshoot image of the outfit ensemble.
+    Uses Google Gemini/Imagen if configured, or photorealistic neural synthesis.
+    """
+    try:
+        req_data = request or LookbookGenRequest()
+        occasion = req_data.occasion or "stylish"
+        items = req_data.items or []
+
+        # Build fashion prompt from outfit pieces
+        item_descs = []
+        for it in items:
+            cat = it.get("category", "clothing")
+            color = it.get("color", "")
+            fabric = it.get("fabric", "")
+            desc = f"{color} {fabric} {cat}".strip()
+            if desc:
+                item_descs.append(desc)
+
+        items_summary = ", ".join(item_descs) if item_descs else "stylish coordinated fashion ensemble"
+
+        # Check if Google GenAI / Gemini API key is available
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+
+        if gemini_api_key:
+            try:
+                from google import genai
+                client = genai.Client(api_key=gemini_api_key)
+                prompt_text = (
+                    f"A high-end editorial fashion lookbook photography of a complete outfit for {occasion}. "
+                    f"The ensemble features: {items_summary}. "
+                    f"Styled on an aesthetic model in an atmospheric {occasion} setting, professional studio lighting, 8k resolution, Vogue magazine style."
+                )
+                result = client.models.generate_images(
+                    model="imagen-3.0-generate-002",
+                    prompt=prompt_text,
+                    config=dict(number_of_images=1, aspect_ratio="3:4")
+                )
+                if result.generated_images:
+                    import base64
+                    img_bytes = result.generated_images[0].image.image_bytes
+                    b64_img = base64.b64encode(img_bytes).decode("utf-8")
+                    return {
+                        "success": True,
+                        "imageUrl": f"data:image/jpeg;base64,{b64_img}",
+                        "source": "gemini"
+                    }
+            except Exception as e:
+                print(f"Gemini API generation notice (falling back to neural synthesis): {e}")
+
+        # High-res photorealistic neural synthesis
+        seed = random.randint(1000, 999999)
+        clean_prompt = (
+            f"cinematic editorial fashion photography, full body outfit for {occasion}, "
+            f"wearing {items_summary}, modern chic aesthetic, warm studio lighting, 8k, photorealistic"
+        )
+        encoded_prompt = urllib.parse.quote(clean_prompt)
+        ai_image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1280&nologo=true&seed={seed}"
+
+        return {
+            "success": True,
+            "imageUrl": ai_image_url,
+            "source": "ai_synthesis",
+            "prompt": clean_prompt
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "isConfigError": False
+        }
+
+
+# ============================================================
+# 3. OUTFIT SAVING, HISTORY, AND FEEDBACK
+# ============================================================
+
+@router.post("/outfit/save")
+@router.post("/outfit/save/")
+async def save_outfit(
+    outfit: OutfitCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    data = outfit.model_dump()
+    data["user_id"] = current_user["user_id"]
+
+    result = supabase.table("outfit_history").insert(data).execute()
+    if not result.data:
+        raise HTTPException(status_code=400, detail="Failed to save outfit")
+
+    # Auto-increment times_worn and update last_worn for rotation tracking
+    item_ids = data.get("item_ids") or []
+    for i_id in item_ids:
+        try:
+            it_res = supabase.table("wardrobe_items").select("times_worn").eq("id", str(i_id)).eq("user_id", current_user["user_id"]).execute()
+            if it_res.data:
+                current_times = it_res.data[0].get("times_worn") or 0
+                supabase.table("wardrobe_items").update({
+                    "times_worn": current_times + 1,
+                    "last_worn": datetime.now().isoformat()
+                }).eq("id", str(i_id)).eq("user_id", current_user["user_id"]).execute()
+        except Exception as e:
+            print(f"Notice: times_worn increment for {i_id} skipped: {e}")
+
+    return result.data[0]
+
+
+@router.get("/outfit/history")
+@router.get("/outfit/history/")
+async def get_history(current_user: dict = Depends(get_current_user)):
+    try:
+        result = (
+            supabase.table("outfit_history")
+            .select("*")
+            .eq("user_id", current_user["user_id"])
+            .order("date", desc=True)
+            .execute()
+        )
+        history = result.data or []
+
+        # Enrich history with actual garment details for seamless UI display
+        if history:
+            try:
+                items_res = (
+                    supabase.table("wardrobe_items")
+                    .select("id, image_url, category, subcategory, color, fabric, style")
+                    .eq("user_id", current_user["user_id"])
+                    .execute()
+                )
+                items_by_id = {str(it["id"]): it for it in (items_res.data or [])}
+                for entry in history:
+                    e_items = []
+                    for i_id in (entry.get("item_ids") or []):
+                        if str(i_id) in items_by_id:
+                            e_items.append(items_by_id[str(i_id)])
+                    entry["items"] = e_items
+            except Exception as e:
+                print(f"Notice: failed to enrich history with items: {e}")
+
+        return history
+    except Exception as e:
+        return []
+
+
+@router.delete("/outfit/history/{history_id}")
+async def delete_history_item(history_id: str, current_user: dict = Depends(get_current_user)):
+    try:
+        supabase.table("outfit_history").delete().eq("id", history_id).eq("user_id", current_user["user_id"]).execute()
+        return {"success": True, "message": "History entry removed"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/outfit/feedback")
+@router.get("/outfit/feedback/")
+async def get_feedback_history(current_user: dict = Depends(get_current_user)):
+    try:
+        result = (
+            supabase.table("feedback")
+            .select("*")
+            .eq("user_id", current_user["user_id"])
+            .execute()
+        )
+        return result.data or []
+    except Exception as e:
+        return []
+
+
+@router.post("/outfit/feedback")
+@router.post("/outfit/feedback/")
+@router.post("/api/outfit/feedback")
+@router.post("/api/outfit/feedback/")
+async def submit_feedback(
+    feedback: FeedbackCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    import uuid
+    data = feedback.model_dump(exclude_unset=True)
+    user_id = current_user["user_id"]
+
+    liked_val = (feedback.sentiment == "like") if feedback.sentiment else data.get("liked", True)
+    rating_val = data.get("rating", 5)
+
+    # Validate outfit_id as genuine UUID; ignore combo-0, combo-1 strings
+    outfit_uuid = None
+    candidate_outfit_id = data.get("outfit_id") or feedback.combo_id
+    if candidate_outfit_id:
+        try:
+            outfit_uuid = str(uuid.UUID(str(candidate_outfit_id)))
+        except (ValueError, TypeError):
+            outfit_uuid = None
+
+    # Collect all items in this feedback
+    items_to_record = []
+    if feedback.item_ids:
+        items_to_record.extend(feedback.item_ids)
+    elif feedback.item_id:
+        items_to_record.append(feedback.item_id)
+    else:
+        items_to_record.append(None)
+
+    excluded_set = set(feedback.excluded_items or [])
+
+    saved_records = []
+    for it_id in items_to_record:
+        row = {
+            "user_id": user_id,
+            "item_id": it_id,
+            "outfit_id": outfit_uuid,
+            "rating": rating_val,
+            "liked": liked_val,
+            "never_wear": it_id in excluded_set if it_id else False
+        }
+        # Filter keys
+        valid_row = {k: v for k, v in row.items() if v is not None or k in ["item_id", "outfit_id"]}
+        try:
+            res = supabase.table("feedback").insert(valid_row).execute()
+            if res.data:
+                saved_records.append(res.data[0])
+        except Exception as e:
+            print(f"Feedback insert notice for item {it_id}: {e}")
+
+    # Process excluded items marked as never_wear
+    if feedback.excluded_items:
+        for ex_id in feedback.excluded_items:
+            try:
+                supabase.table("wardrobe_items").update({"never_wear": True}).eq("id", ex_id).eq("user_id", user_id).execute()
+            except Exception as e:
+                print(f"Never wear update error for {ex_id}: {e}")
+    elif feedback.item_id and feedback.never_wear:
+        try:
+            supabase.table("wardrobe_items").update({"never_wear": True}).eq("id", feedback.item_id).eq("user_id", user_id).execute()
+        except Exception as e:
+            print(f"Never wear update error for {feedback.item_id}: {e}")
+
+    return saved_records[0] if saved_records else {"success": True}
+
+
+# ============================================================
+# 6. LIVE WEATHER & AQI AGENT ENDPOINT
+# ============================================================
+
+@router.get("/api/weather")
+@router.get("/weather")
+@router.get("/api/weather/")
+@router.get("/weather/")
+async def fetch_weather_api(city: str = "Noida"):
+    """
+    Returns real-time weather metrics, high/low/medium badges,
+    and Air Quality Index (AQI) with styling suggestions.
+    """
+    try:
+        data = get_weather(city)
+        return {"success": True, "weather": data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch weather: {str(e)}")
+
+
+
+======================================================================
+FILE: backend\app\routes\profile.py
+======================================================================
+
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from app.core.security import get_current_user
+from app.core.supabase_client import supabase
+
+from app.schemas.user_profile import (
+    ProfileCreate,
+    ProfileUpdate,
+    ProfileResponse,
+)
+
+
+router = APIRouter(
+    prefix="/profile",
+    tags=["profile"]
+)
+
+
+ALLOWED_PROFILE_COLUMNS = {
+    "user_id", "skin_tone", "height", "weight", "gender",
+    "favorite_colors", "avoided_colors", "favorite_styles", "sizes"
+}
+
+
+# ============================================================
+# CREATE PROFILE
+# ============================================================
+
+@router.post("", response_model=ProfileResponse)
+@router.post("/", response_model=ProfileResponse)
+async def create_profile(
+    profile: ProfileCreate,
+    current_user: dict = Depends(get_current_user),
+):
+
+    data = profile.model_dump()
+
+    # NEVER take user_id from frontend
+    data["user_id"] = current_user["user_id"]
+    db_data = {k: v for k, v in data.items() if k in ALLOWED_PROFILE_COLUMNS}
+
+    result = (
+        supabase
+        .table("user_profile")
+        .insert(db_data)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to create profile"
+        )
+
+    return result.data[0]
+
+
+# ============================================================
+# UPDATE PROFILE
+# ============================================================
+
+@router.patch("", response_model=ProfileResponse)
+@router.patch("/", response_model=ProfileResponse)
+async def update_profile(
+    profile: ProfileUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+
+    data = profile.model_dump(
+        exclude_unset=True
+    )
+
+    # User ID backend se
+    user_id = current_user["user_id"]
+    db_data = {k: v for k, v in data.items() if k in ALLOWED_PROFILE_COLUMNS}
+
+    if not db_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No fields provided for update"
+        )
+
+    result = (
+        supabase
+        .table("user_profile")
+        .update(db_data)
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile not found"
+        )
+
+    return result.data[0]
+
+
+# ============================================================
+# GET PROFILE
+# ============================================================
+
+@router.get("", response_model=ProfileResponse)
+@router.get("/", response_model=ProfileResponse)
+async def get_profile(
+    current_user: dict = Depends(get_current_user),
+):
+
+    result = (
+        supabase
+        .table("user_profile")
+        .select("*")
+        .eq("user_id", current_user["user_id"])
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Profile not found"
+        )
+
+    return result.data[0]
+
+
+
+======================================================================
+FILE: backend\app\routes\wardrobe.py
+======================================================================
+
+from typing import Optional
+from fastapi import APIRouter, HTTPException, status, File,Depends
+from app.core.security import get_current_user
+from fastapi import UploadFile
+from PIL import Image
+from rembg import new_session, remove
+from io import BytesIO
+from app.core.supabase_client import supabase
+import uuid
+from app.core.vision_tagging import tag_clothing_image
+from app.schemas.wardrobe_items import WardrobeItemUpdate,WardrobeItemCreate,WardrobeItemResponse
+
+router = APIRouter(
+    prefix="/wardrobe",
+    tags=["wardrobe"]
+)
+
+ALLOWED_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".jfif",
+    ".png",
+    ".webp",
+    ".heic",
+    ".heif",
+}
+
+ALLOWED_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+}
+BUCKET_NAME = "wardobe-images"   # yahan exact bucket naam confirm karke daalo
+
+
+rembg_session = new_session("u2net")
+
+
+@router.post("/upload",response_model=WardrobeItemResponse)
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user = Depends(get_current_user)
+):
+    if not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="file name is missing!"
+        )
+
+    extension = "." + file.filename.split(".")[-1].lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only JPG, JPEG, PNG, HEIC and HEIF images are allowed"
+        )
+
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid image type"
+        )
+
+    content = await file.read()
+
+    image = Image.open(BytesIO(content))
+    image = image.convert("RGB")
+    image.thumbnail((800, 800))
+
+    # Background removal
+    image_no_bg = remove(image, session=rembg_session)
+
+    # RGBA -> RGB conversion (transparent parts ko white se replace)
+    if image_no_bg.mode == "RGBA":
+        background = Image.new("RGB", image_no_bg.size, (255, 255, 255))
+        background.paste(image_no_bg, mask=image_no_bg.split()[3])
+        image_no_bg = background
+
+    # Cleaned (bg-removed) image ko hi save/compress karo
+    buffer = BytesIO()
+    image_no_bg.save(buffer, format="JPEG", quality=80)
+    compressed_bytes = buffer.getvalue()
+
+    unique_filename = f"{uuid.uuid4()}.jpg"
+
+    supabase.storage.from_(BUCKET_NAME).upload(
+        unique_filename,
+        compressed_bytes,
+        {"content-type": "image/jpeg"}
+    )
+
+    public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(unique_filename)
+    current_user_id = current_user["user_id"]
+    
+    tags = tag_clothing_image(public_url)
+    
+    item_data = WardrobeItemCreate(
+        image_url=public_url,
+        category=tags.get("category"),
+        subcategory=tags.get("subcategory"),
+        color=tags.get("color"),
+        pattern=tags.get("pattern"),
+        formality=tags.get("formality"),
+        fabric=tags.get("fabric"),
+        style=tags.get("style"),
+    )
+    insert_data = item_data.model_dump()
+    insert_data["user_id"] = current_user_id
+    
+    result = supabase.table("wardrobe_items").insert(insert_data).execute()
+    return result.data[0]
+    
+
+
+@router.get("/",response_model = list[WardrobeItemResponse])
+async def get_wardrobe(
+    category: Optional[str] = None,
+    current_user = Depends(get_current_user)
+):
+    current_user_id = current_user["user_id"]
+    query = supabase.table("wardrobe_items").select("*").eq("user_id",current_user_id )
+
+    if category:
+        query = query.eq("category", category)
+
+    result = query.execute()
+    return result.data
+
+@router.patch("/{item_id}",response_model = WardrobeItemResponse)
+async def update_wardrobe_item(
+    item_id: str,
+    updates: WardrobeItemUpdate,
+    current_user = Depends(get_current_user)
+):
+    update_data = updates.model_dump(exclude_unset=True)
+    current_user_id = current_user["user_id"]
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields provided to update")
+
+    result = (
+        supabase.table("wardrobe_items")
+        .update(update_data)
+        .eq("id", item_id)
+        .eq("user_id",current_user_id)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return result.data[0]
+
+@router.delete("/{item_id}")
+async def delete_wardrobe_item(
+    item_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    result = (
+        supabase.table("wardrobe_items")
+        .delete()
+        .eq("id", item_id)
+        .eq("user_id", current_user["user_id"])   # ye line add karo
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    return {"message": "Item deleted successfully"}
+
+
+
+======================================================================
+FILE: backend\app\schemas\feedback.py
+======================================================================
+
+from pydantic import BaseModel
+from typing import Optional, List
+
+class FeedbackCreate(BaseModel):
+    item_id: Optional[str] = None
+    outfit_id: Optional[str] = None
+    rating: Optional[int] = None
+    liked: Optional[bool] = None
+    never_wear: Optional[bool] = False
+    sentiment: Optional[str] = None
+    combo_id: Optional[str] = None
+    excluded_items: Optional[List[str]] = []
+    item_ids: Optional[List[str]] = []
+
+
+
+======================================================================
+FILE: backend\app\schemas\outfit.py
+======================================================================
+
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+
+class OutfitRecommendRequest(BaseModel):
+    occasion: str
+    city: str
+    skin_undertone: Optional[str] = "neutral"
+
+class OutfitCreate(BaseModel):
+    item_ids: list[str]
+    occasion: Optional[str] = None
+    weather: Optional[str] = None
+    reasoning: Optional[str] = None
+    kept: bool = True
+
+class OutfitResponse(BaseModel):
+    id: str
+    user_id: str
+    item_ids: list[str]
+    occasion: Optional[str] = None
+    weather: Optional[str] = None
+    reasoning: Optional[str] = None
+    kept: bool
+    date: datetime
+
+
+
+======================================================================
+FILE: backend\app\schemas\user_profile.py
+======================================================================
+
+from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+
+
+SkinTone = Literal["warm", "cool", "neutral"]
+Gender = Literal["male", "female", "other", "prefer_not_to_say"]
+BodyType = Literal["petite", "average", "tall", "plus", "athletic"]
+PreferredFit = Literal["tailored", "slim", "relaxed", "oversized", "hybrid"]
+StylePersona = Literal[
+    "Casual", "Smart Casual", "Minimalist", "Classic", "Streetwear",
+    "Formal", "Bohemian", "Ethnic", "Sporty", "Maximalist"
+]
+
+
+class ProfileCreate(BaseModel):
+
+    skin_tone: SkinTone = "neutral"
+
+    height: Annotated[
+        float | None,
+        Field(gt=50, lt=250, description="Height in cm")
+    ] = None
+
+    weight: Annotated[
+        float | None,
+        Field(gt=20, lt=300, description="Weight in kg")
+    ] = None
+
+    gender: Gender | None = "prefer_not_to_say"
+
+    body_type: BodyType | None = "average"
+
+    preferred_fit: PreferredFit | None = "tailored"
+
+    style_persona: StylePersona | None = "Casual"
+
+    favorite_colors: list[str] = Field(
+        default_factory=list,
+        description="Preferred colors by user"
+    )
+
+    avoided_colors: list[str] = Field(
+        default_factory=list,
+        description="Colors the user wants to avoid"
+    )
+
+    favorite_styles: list[str] = Field(
+        default_factory=list,
+        description="Preferred clothing styles"
+    )
+
+    sizes: dict[str, str] = Field(
+        default_factory=dict,
+        description="Clothing sizes by category"
+    )
+
+
+class ProfileUpdate(BaseModel):
+
+    skin_tone: SkinTone | None = None
+
+    height: Annotated[
+        float | None,
+        Field(gt=50, lt=250, description="Height in cm")
+    ] = None
+
+    weight: Annotated[
+        float | None,
+        Field(gt=20, lt=300, description="Weight in kg")
+    ] = None
+
+    gender: Gender | None = None
+
+    body_type: BodyType | None = None
+
+    preferred_fit: PreferredFit | None = None
+
+    style_persona: StylePersona | None = None
+
+    favorite_colors: list[str] | None = None
+
+    avoided_colors: list[str] | None = None
+
+    favorite_styles: list[str] | None = None
+
+    sizes: dict[str, str] | None = None
+
+
+class ProfileResponse(ProfileCreate):
+    user_id: str
+
+
+
+======================================================================
+FILE: backend\app\schemas\wardrobe_items.py
+======================================================================
+
+from pydantic import BaseModel
+from typing import Optional
+from datetime import date, datetime
+
+class WardrobeItemCreate(BaseModel):
+    image_url: str
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    color: Optional[str] = None
+    pattern: Optional[str] = None
+    formality: Optional[str] = None
+    style:Optional[str] = None
+    fabric: Optional[str] = None
+
+class WardrobeItemUpdate(BaseModel):
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    color: Optional[str] = None
+    pattern: Optional[str] = None
+    formality: Optional[str] = None
+    fabric: Optional[str] = None
+    never_wear: Optional[bool] = None
+    style:Optional[str] = None
+
+class WardrobeItemResponse(BaseModel):
+    id: str
+    user_id: str
+    image_url: str
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    color: Optional[str] = None
+    pattern: Optional[str] = None
+    formality: Optional[str] = None
+    fabric: Optional[str] = None
+    times_worn: int
+    style:Optional[str] = None
+    last_worn: Optional[date] = None
+    never_wear: bool
+    created_at: datetime
+
+

@@ -1,0 +1,13 @@
+[project]
+name = "outfit-ai-recomm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.5.0",
+    "groq>=1.7.0",
+    "langchain>=1.4.0",
+    "pydantic-settings>=2.15.0",
+    "rembg>=2.0.83",
+]

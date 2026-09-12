@@ -1,0 +1,38 @@
+# Secrets and Environment Variables
+.env
+.env.*
+!.env.example
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.log
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Node & Frontend
+node_modules/
+react/node_modules/
+react/dist/
+.npm
+npm-debug.log*
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.kilo/
+.gemini/
+
+# Model & Cache directories
+.u2net/
+scratch/

@@ -1,0 +1,153 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "SF Pro", "Plus Jakarta Sans", "Inter", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: #FAF9FC;
+    color: #18181B;
+    line-height: 1.5;
+  }
+
+  h1, h2, h3, h4, h5, h6, .font-serif-luxury, .font-ios-display {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "SF Pro", "Plus Jakarta Sans", "Inter", system-ui, sans-serif !important;
+    letter-spacing: -0.028em;
+  }
+
+  .font-mono-code {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* =========================================================
+   GLOBAL OVERFLOW & HORIZONTAL SCROLLBAR REMOVAL
+   ========================================================= */
+html,
+body,
+#root {
+  overflow-x: hidden !important;
+  max-width: 100vw !important;
+  width: 100% !important;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Remove all horizontal scrollbars across the entire website */
+::-webkit-scrollbar:horizontal,
+*::-webkit-scrollbar:horizontal {
+  display: none !important;
+  height: 0px !important;
+  width: 0px !important;
+}
+
+/* Utility to hide scrollbars */
+.no-scrollbar::-webkit-scrollbar {
+  display: none !important;
+  height: 0px !important;
+  width: 0px !important;
+}
+.no-scrollbar {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}
+
+/* Vertical Custom Scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #C4B5FD;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #A78BFA;
+}
+
+/* =========================================================
+   AURA LUXURY DARK MODE: PURE TRUE BLACK (NO NAVY BLUE)
+   ========================================================= */
+html.dark {
+  color-scheme: dark;
+}
+
+html.dark body,
+html.dark #root {
+  background-color: #000000 !important;
+  color: #FFFFFF !important;
+}
+
+html.dark header {
+  background-color: rgba(10, 10, 10, 0.95) !important;
+  border-color: #27272A !important;
+}
+
+html.dark .bg-white {
+  background-color: #0F0F12 !important;
+  color: #FFFFFF !important;
+  border-color: #27272A !important;
+}
+
+html.dark .bg-\[\#FAFAF8\] {
+  background-color: #18181B !important;
+  color: #FFFFFF !important;
+  border-color: #27272A !important;
+}
+
+html.dark .bg-\[\#FAFAF8\]\/70,
+html.dark .bg-\[\#FAFAF8\]\/50 {
+  background-color: rgba(24, 24, 27, 0.7) !important;
+  border-color: #27272A !important;
+}
+
+html.dark .bg-\[\#F8F7FC\],
+html.dark .bg-\[\#FAF9FC\] {
+  background-color: #18181B !important;
+  color: #FFFFFF !important;
+  border-color: #27272A !important;
+}
+
+html.dark .bg-\[\#F0FDF4\] {
+  background-color: rgba(6, 78, 59, 0.28) !important;
+  border-color: rgba(16, 185, 129, 0.35) !important;
+}
+
+html.dark .border-\[\#DCFCE7\],
+html.dark .border-\[\#BBF7D0\] {
+  border-color: rgba(16, 185, 129, 0.35) !important;
+}
+
+html.dark .border-\[\#E9E7EF\],
+html.dark .border-\[\#ECEAF2\],
+html.dark .border-\[\#DDD6FE\],
+html.dark .border-\[\#EDE9FE\],
+html.dark .border-\[\#28243D\],
+html.dark .border-\[\#2E2A48\],
+html.dark .divide-\[\#F3F4F6\] > * {
+  border-color: #27272A !important;
+}
+
+html.dark input,
+html.dark select,
+html.dark textarea {
+  background-color: #121214 !important;
+  color: #FFFFFF !important;
+  border-color: #27272A !important;
+}
+
+html.dark footer {
+  background-color: #0A0A0A !important;
+  border-color: #27272A !important;
+}
+
+html.dark .glass-panel {
+  background: rgba(15, 15, 18, 0.95) !important;
+  border-color: rgba(39, 39, 42, 0.8) !important;
+}
