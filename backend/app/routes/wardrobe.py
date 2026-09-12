@@ -1,7 +1,6 @@
 from typing import Optional
 from fastapi import APIRouter, HTTPException, status, File, Depends, UploadFile
 from PIL import Image
-from rembg import new_session, remove
 from io import BytesIO
 from app.core.security import get_current_user
 from app.core.supabase_client import supabase
@@ -16,7 +15,15 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".heic", ".heif
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}
 BUCKET_NAME = "wardobe-images"
 
-rembg_session = new_session("u2net")
+_rembg_session = None
+
+
+def get_rembg_session():
+    global _rembg_session
+    if _rembg_session is None:
+        from rembg import new_session
+        _rembg_session = new_session("u2net")
+    return _rembg_session
 
 
 @router.post("/upload", response_model=WardrobeItemResponse)
@@ -34,7 +41,9 @@ async def upload_file(file: UploadFile = File(...), current_user=Depends(get_cur
     image = Image.open(BytesIO(content)).convert("RGB")
     image.thumbnail((800, 800))
 
-    image_no_bg = remove(image, session=rembg_session)
+    from rembg import remove
+    session = get_rembg_session()
+    image_no_bg = remove(image, session=session)
     if image_no_bg.mode == "RGBA":
         background = Image.new("RGB", image_no_bg.size, (255, 255, 255))
         background.paste(image_no_bg, mask=image_no_bg.split()[3])
