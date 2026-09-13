@@ -2,7 +2,7 @@ import json
 from groq import Groq
 from app.core.config import settings
 
-client = Groq(api_key=settings.groq_api_key)
+client = Groq(api_key=settings.groq_api_key or "gsk_placeholder")
 
 TAGGING_PROMPT = """You are a fashion cataloging assistant. Look at this clothing item image and return ONLY a JSON object with these exact keys:
 

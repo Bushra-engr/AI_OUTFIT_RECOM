@@ -12,7 +12,7 @@ from app.core.supabase_client import supabase
 from app.core.weather_agent import get_weather
 
 logger = logging.getLogger(__name__)
-groq_client = Groq(api_key=settings.groq_api_key)
+groq_client = Groq(api_key=settings.groq_api_key or "gsk_placeholder")
 
 # In-memory recommendation cache (5 min TTL) for instant 0ms responses on repeated occasion selections
 _AI_RECOMMENDATIONS_CACHE: dict[str, tuple[float, list[dict]]] = {}
