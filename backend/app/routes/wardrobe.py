@@ -41,13 +41,16 @@ async def upload_file(file: UploadFile = File(...), current_user=Depends(get_cur
     image = Image.open(BytesIO(content)).convert("RGB")
     image.thumbnail((800, 800))
 
-    from rembg import remove
-    session = get_rembg_session()
-    image_no_bg = remove(image, session=session)
-    if image_no_bg.mode == "RGBA":
-        background = Image.new("RGB", image_no_bg.size, (255, 255, 255))
-        background.paste(image_no_bg, mask=image_no_bg.split()[3])
-        image_no_bg = background
+    try:
+        from rembg import remove
+        session = get_rembg_session()
+        image_no_bg = remove(image, session=session)
+        if image_no_bg.mode == "RGBA":
+            background = Image.new("RGB", image_no_bg.size, (255, 255, 255))
+            background.paste(image_no_bg, mask=image_no_bg.split()[3])
+            image_no_bg = background
+    except Exception as rembg_err:
+        image_no_bg = image
 
     buffer = BytesIO()
     image_no_bg.save(buffer, format="JPEG", quality=80)
